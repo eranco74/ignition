@@ -1,0 +1,5 @@
+mock
+pycodestyle
+pylint
+pytest 
+pytest-cov
