@@ -3,25 +3,23 @@
 import os
 import json
 import shutil
-
-from datauri import DataURI
-from argparse import ArgumentParser
 import logging
+from argparse import ArgumentParser
+from datauri import DataURI
 
 logging.basicConfig(level=logging.INFO)
 
 
 def is_valid_file(parser, arg):
     if not os.path.exists(arg):
-        parser.error("The file %s does not exist!" % arg)
-    else:
-        return arg
+        return parser.error("The file %s does not exist!" % arg)
+    return arg
 
 
-class IgnitionExtract(object):
+class IgnitionExtract():
 
-    def __init__(self, ignition_path, base_dir):
-        self.ignition = ignition_path
+    def __init__(self, ignition, base_dir):
+        self.ignition = ignition
         self.base_dir = base_dir
         # SYSTEMD_PATH is the path systemd modifiable units, services, etc.. reside
         self.systemd_path = os.path.join(self.base_dir, "etc/systemd/system")
@@ -32,65 +30,72 @@ class IgnitionExtract(object):
 
     def update_files(self):
         """update_files writes files and systemd units specified in the ignition to disk."""
-        ign = json.load(open(self.ignition))
-        self.write_files(ign['storage']['files'])
-        self.write_units(ign["systemd"]['units'])
+        self.write_files(self.ignition['storage']['files'])
+        self.write_units(self.ignition["systemd"]['units'])
 
     def write_files(self, ignition_files):
         """writes the given files to disk."""
-        for f in ignition_files:
-            path = self.base_dir + f["path"]
-            mode = f["mode"]
+        for file_info in ignition_files:
+            path = self.base_dir + file_info["path"]
+            mode = file_info["mode"]
             # convert the data to the actual content
-            content = DataURI(f["contents"]['source'])
+            content = DataURI(file_info["contents"]['source'])
             logging.info("Creating dir: %s", os.path.dirname(path))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             logging.info("Opening file: %s", path)
-            with open(path, "w") as f:
+            with open(path, "w") as out_file:
                 logging.debug("Writing content: %s", content.text)
-                f.write(content.text)
+                out_file.write(content.text)
             logging.info("Running chmod permissions: %s, path: %s", mode, path)
             os.chmod(path, mode)
 
     def write_units(self, units):
         """writes the systemd units to disk"""
-        for u in units:
-            # write the dropin to disk
-            for dropin in u.get("dropins", []):
-                logging.info("Writing systemd unit dropin %s", dropin["name"])
-                path = os.path.join(self.systemd_path, u["name"] + ".d", dropin["name"])
-                logging.info("Creating dir: %s", os.path.dirname(path))
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as f:
-                    logging.debug("Writing content: %s", dropin["contents"])
-                    f.write(dropin["contents"])
-                logging.info("Wrote systemd unit dropin at %s", path)
-
-            unit_name = u["name"]
+        for unit in units:
+            unit_name = unit["name"]
             unit_path = os.path.join(self.systemd_path, unit_name)
+            # write the dropin to disk
+            for dropin in unit.get("dropins", []):
+                self.write_unit_dropin(dropin, unit_name)
             # In case the unit is masked. if the unit is masked delete it and write a symlink to /dev/null
-            if u.get("mask"):
-                logging.info("Systemd unit masked")
-                shutil.rmtree(unit_path)
-                logging.info("Removed unit %s", unit_name)
-                os.symlink(self.dev_null_path, unit_path)
-                logging.info("Created symlink unit %s to %s", unit_name, self.dev_null_path)
+            if unit.get("mask"):
+                self.mask_unit(unit_name, unit_path)
                 continue
-
-            if u.get("contents"):
-                logging.info("Writing systemd unit %s", unit_name)
-                # write the unit to disk
-                with open(unit_path, "w") as f:
-                    logging.debug("Writing content: %s", u["contents"])
-                    f.write(u["contents"])
-
-                logging.info("Successfully wrote systemd unit %s: ", unit_name)
+            if unit.get("contents"):
+                self.write_unit(unit_name, unit_path, unit.get("contents"))
 
             # if the unit should be enabled, then enable it, otherwise the unit will ve disabled
-            if u.get("enabled"):
+            if unit.get("enabled"):
                 self.enable_unit(unit_name)
             else:
                 self.disable_unit(unit_name)
+
+    def write_unit_dropin(self, dropin, unit_name):
+        logging.info("Writing systemd unit dropin %s", dropin["name"])
+        path = os.path.join(self.systemd_path, unit_name + ".d", dropin["name"])
+        logging.info("Creating dir: %s", os.path.dirname(path))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        logging.info("Opening file: %s", path)
+        with open(path, "w") as out_file:
+            logging.debug("Writing content: %s", dropin["contents"])
+            out_file.write(dropin["contents"])
+        logging.info("Wrote systemd unit dropin at %s", path)
+
+    @staticmethod
+    def write_unit(unit_name, unit_path, content):
+        logging.info("Writing systemd unit %s", unit_name)
+        # write the unit to disk
+        with open(unit_path, "w") as out_file:
+            logging.debug("Writing content: %s", content)
+            out_file.write(content)
+        logging.info("Successfully wrote systemd unit %s: ", unit_name)
+
+    def mask_unit(self, unit_name, unit_path):
+        logging.info("Systemd unit masked")
+        shutil.rmtree(unit_path)
+        logging.info("Removed unit %s", unit_name)
+        os.symlink(self.dev_null_path, unit_path)
+        logging.info("Created symlink unit %s to %s", unit_name, self.dev_null_path)
 
     def enable_unit(self, unit_name):
         """enable_unit enables a systemd unit via symlink"""
@@ -102,9 +107,9 @@ class IgnitionExtract(object):
             logging.info("%s already exists. Not making a new symlink", wants_path)
             return
         # The originating file to link
-        service_path = os.path.join(self.systemd_path, unit_name)
+        unit_path = os.path.join(self.systemd_path, unit_name)
         logging.info("Enabling unit at %s", wants_path)
-        os.symlink(service_path, wants_path)
+        os.symlink(unit_path, wants_path)
         logging.info("Enabled %s", unit_name)
 
     def disable_unit(self, unit_name):
@@ -133,7 +138,8 @@ def main():
                         type=str)
 
     args = parser.parse_args()
-    IgnitionExtract(args.filename, args.base_dir).update_files()
+    ignition = json.load(open(args.filename))
+    IgnitionExtract(ignition=ignition, base_dir=args.base_dir).update_files()
 
 
 if __name__ == '__main__':
